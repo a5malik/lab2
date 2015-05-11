@@ -43,8 +43,100 @@ MODULE_AUTHOR("Skeletor");
  * as an argument to insmod: "insmod osprd.ko nsectors=4096" */
 static int nsectors = 32;
 module_param(nsectors, int, 0);
+void pushpid(struct list* l, pid_t pid)
+{
+	struct listnode* node = (struct listnode*)kmalloc(sizeof(struct listnode),GFP_ATOMIC);
+	node->next = NULL;
+	node->pid = pid;
+	if(num == 0)
+	{
+		l->head = l->tail = node;
+	}
+	else
+	{
+		l->tail->next = node;
+		l->tail = l->tail->next;
+	}
+	l->num++;
+}
 
+int findpid(struct list* l, pid_t pid, char remove)
+{
+	struct listnode* curnode = l->head;
+	if(l->num == 0)
+		return 0;
+	if(l->head->pid == pid)
+	{
+		if(remove == 'r')
+		{		
+		struct listnode* temp = l->head;
+		l->head = l->head->next;
+		kfree(l->temp);
+		l->num--;
+		}
+		return 1;
+	}
+	while(curnode->next != NULL)
+	{
+		if(curnode->next->pid == pid)
+		{
+			if(remove == 'r')
+			{
+				curnode->next = curnode->next->next;
+				l->num--;
+			}
+			return 1;
+		}
+	}
+	return 0;
+}
+void pushticket(struct list* l, unsigned int ticket)
+{
+	struct listnode* node = (struct listnode*)kmalloc(sizeof(struct listnode),GFP_ATOMIC);
+	node->next = NULL;
+	node->ticket= ticket;
+	if(num == 0)
+	{
+		l->head = l->tail = node;
+	}
+	else
+	{
+		l->tail->next = node;
+		l->tail = l->tail->next;
+	}
+	l->num++;
+}
 
+int findticket(struct list* l, unsigned int ticket, char remove)
+{
+	struct listnode* curnode = l->head;
+	if(l->num == 0)
+		return 0;
+	if(l->head->ticket== ticket)
+	{
+		if(remove == 'r')
+		{		
+		struct listnode* temp = l->head;
+		l->head = l->head->next;
+		kfree(l->temp);
+		l->num--;
+		}
+		return 1;
+	}
+	while(curnode->next != NULL)
+	{
+		if(curnode->next->ticket == ticket)
+		{
+			if(remove == 'r')
+			{
+				curnode->next = curnode->next->next;
+				l->num--;
+			}
+			return 1;
+		}
+	}
+	return 0;
+}
 /* The internal representation of our device. */
 typedef struct osprd_info {
 	uint8_t *data;                  // The data array. Its size is
@@ -61,10 +153,12 @@ typedef struct osprd_info {
 
 	wait_queue_head_t blockq;       // Wait queue for tasks blocked on
 					// the device lock
-
 	/* HINT: You may want to add additional fields to help
 	         in detecting deadlock. */
-
+	struct list* readlockPids;
+	pid_t writelockPid;
+	int nwriters;
+	struct list* exitlist;
 	// The following elements are used internally; you don't need
 	// to understand them.
 	struct request_queue *queue;    // The device request queue.
@@ -79,6 +173,13 @@ static osprd_info_t osprds[NOSPRD];
 
 // Declare useful helper functions
 
+unsigned int get_ticket()
+{
+	osp_spin_lock(&d->mutex);
+	my_ticket = d->ticket_head;
+	d->ticket_head++;
+	osp_spin_unlock(&d->mutex);
+}
 /*
  * file2osprd(filp)
  *   Given an open file, check whether that file corresponds to an OSP ramdisk.
@@ -123,7 +224,7 @@ static void osprd_process_request(osprd_info_t *d, struct request *req)
 	// Your code here.
 	//eprintk("Should process request...\n");
 	uint8_t* ptr = d->data + (req->sector)*SECTOR_SIZE;
-	if(req_data_dir(req) == READ)
+	if(rq_data_dir(req) == READ)
 	{
 		memcpy(req->buffer, ptr, req->current_nr_sectors * SECTOR_SIZE);
 	}
@@ -162,8 +263,29 @@ static int osprd_close_last(struct inode *inode, struct file *filp)
 		// Your code here.
 
 		// This line avoids compiler warnings; you may remove it.
+		
+		osp_spin_lock(&d->mutex);
+		char wake = 't';
+		if(d->readlockPids->num > 1)
+		{
+			findpid(d->readlockPids,current->pid,'r');
+			wake = 'f';
+		}
+		else if(d->readlockPids->num == 1)
+		{
+			findpid(d->readlockPids,current->pid,'r');
+			filp->f_flags &= ~F_OSPRD_LOCKED;
+		}
+		else //must be a writer.....
+		{
+			d->nwriters = 0;
+			filp->f_flags &= ~F_OSPRD_LOCKED;
+		}
+		osp_spin_unlock(&d->mutex);
+		if(wake == 't')
+			wake_up_all(d->blockq);
 		(void) filp_writable, (void) d;
-
+	return 0;
 	}
 
 	return 0;
@@ -183,7 +305,7 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 {
 	osprd_info_t *d = file2osprd(filp);	// device info
 	int r = 0;			// return value: initially 0
-
+	unsigned int my_ticket;
 	// is file open for writing?
 	int filp_writable = (filp->f_mode & FMODE_WRITE) != 0;
 
@@ -230,9 +352,56 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// be protected by a spinlock; which ones?)
 
 		// Your code here (instead of the next two lines).
-		eprintk("Attempting to acquire\n");
+		if(filp_writable)
+		{
+			my_ticket = get_ticket();
+			int stat = wait_event_interruptible(d->blockq, d->ticket_tail == my_ticket && d->nwriters == 0 && d->readlockPids->num == 0);
+			if(stat == -ERESTARTSYS)
+			{
+				osp_spin_lock(&d->mutex);
+				pushticket(d->exitlist,my_ticket); //what if multiple processes get killed at the same time
+				osp_spin_unlock(&d->mutex);
+				r = stat;
+			}
+			else
+			{
+				osp_spin_lock(&d->mutex);
+				d->nwriters = 1;
+				d->writelockPid = current->pid; 
+				filp->f_flags |= F_OSPRD_LOCKED; // 
+				d->ticket_tail++;//writer calls wake up all only when it releases...
+				while(findticket(exitlist,d->ticket_tail,'f') && d->ticket_tail<d->ticket_head)
+					d->ticket_tail++;
+				osp_spin_unlock(&d->mutex);
+				
+				r = 0;
+			}
+		}
+		else
+		{
+			my_ticket = get_ticket();
+			int stat = wait_event_interruptible(d->blockq, d->ticket_tail == my_ticket && d->nwriters == 0);
+			if(stat == -ERESTARTSYS)
+			{
+				osp_spin_lock(&d->mutex);
+				pushticket(d->exitlist,my_ticket); //what if multiple processes get killed at the same time
+				osp_spin_unlock(&d->mutex);
+				r = stat;
+			}
+			else // got the lock
+			{	
+				osp_spin_lock(&d->mutex); //multiple readers try to push into readlist
+				pushpid(d->readlockPids, current->pid);
+				d->ticket_tail++;
+				filp->f_flags |= F_OSPRD_LOCKED;
+				osp_spin_unlock(&d->mutex);
+				wake_up_all(d->blockq);// just incrementing ticket_tail doesnt work, must also wake up all to make them reevaluate condition.
+				r = 0;
+			}
+		}
+		/*eprintk("Attempting to acquire\n");
 		r = -ENOTTY;
-
+		*/
 	} else if (cmd == OSPRDIOCTRYACQUIRE) {
 
 		// EXERCISE: ATTEMPT to lock the ramdisk.
@@ -241,10 +410,37 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// block.  If OSPRDIOCACQUIRE would block or return deadlock,
 		// OSPRDIOCTRYACQUIRE should return -EBUSY.
 		// Otherwise, if we can grant the lock request, return 0.
-
+		if(filp_writable)
+		{
+			osp_spin_lock(&d->mutex);
+			if(d->nwriters == 0 && d->readlockPids->num == 0)
+			{
+				d->nwriters = 1;
+				d->writelockPid = current->pid;
+				filp->f_flags |= F_OSPRD_LOCKED;
+				r = 0;
+			}
+			else r = -EBUSY;
+			osp_spin_unlock(&d->mutex);
+		}
+		else
+		{
+			osp_spin_lock(&d->mutex);
+			if(d->nwriters == 0)
+			{
+				pushpid(d->readlockPids, current->pid);
+				filp->f_flags |= F_OSPRD_LOCKED;
+				r = 0;
+			}
+			else 
+				r = -EBUSY;
+			osp_spin_unlock(&d->mutex);
+		}
+		
 		// Your code here (instead of the next two lines).
-		eprintk("Attempting to try acquire\n");
-		r = -ENOTTY;
+		
+		//eprintk("Attempting to try acquire\n");
+		//r = -ENOTTY;
 
 	} else if (cmd == OSPRDIOCRELEASE) {
 
@@ -256,8 +452,32 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// you need, and return 0.
 
 		// Your code here (instead of the next line).
-		r = -ENOTTY;
-
+		//r = -ENOTTY;
+		
+		if(!(file->f_flags & F_OSPRD_LOCKED))
+			return -EINVAL;
+		osp_spin_lock(&d->mutex);
+		char wake = 't';
+		if(d->readlockPids->num > 1)
+		{
+			findpid(d->readlockPids,current->pid,'r');
+			wake = 'f';
+		}
+		else if(d->readlockPids->num == 1)
+		{
+			findpid(d->readlockPids,current->pid,'r');
+			filp->f_flags &= ~F_OSPRD_LOCKED;
+		}
+		else //must be a writer.....
+		{
+			d->nwriters = 0;
+			filp->f_flags &= ~F_OSPRD_LOCKED;
+		}
+		osp_spin_unlock(&d->mutex);
+		if(wake == 't')
+			wake_up_all(d->blockq);
+		r = 0;
+		
 	} else
 		r = -ENOTTY; /* unknown command */
 	return r;
@@ -272,6 +492,11 @@ static void osprd_setup(osprd_info_t *d)
 	init_waitqueue_head(&d->blockq);
 	osp_spin_lock_init(&d->mutex);
 	d->ticket_head = d->ticket_tail = 0;
+	d->readlockPids = kmalloc(sizeof(struct list),GFP_ATOMIC);
+	d->readlockPids->num = 0;
+	d->exitlist = kmalloc(sizeof(struct list),GFP_ATOMIC);
+	d->exitlist->num = 0;
+	d->nwriters = 0;
 	/* Add code here if you add fields to osprd_info_t. */
 }
 

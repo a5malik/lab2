@@ -48,7 +48,7 @@ void pushpid(struct list* l, pid_t pid)
 	struct listnode* node = (struct listnode*)kmalloc(sizeof(struct listnode),GFP_ATOMIC);
 	node->next = NULL;
 	node->pid = pid;
-	if(num == 0)
+	if(l->num == 0)
 	{
 		l->head = l->tail = node;
 	}
@@ -71,7 +71,7 @@ int findpid(struct list* l, pid_t pid, char remove)
 		{		
 		struct listnode* temp = l->head;
 		l->head = l->head->next;
-		kfree(l->temp);
+		kfree(temp);
 		l->num--;
 		}
 		return 1;
@@ -95,7 +95,7 @@ void pushticket(struct list* l, unsigned int ticket)
 	struct listnode* node = (struct listnode*)kmalloc(sizeof(struct listnode),GFP_ATOMIC);
 	node->next = NULL;
 	node->ticket= ticket;
-	if(num == 0)
+	if(l->num == 0)
 	{
 		l->head = l->tail = node;
 	}
@@ -118,7 +118,7 @@ int findticket(struct list* l, unsigned int ticket, char remove)
 		{		
 		struct listnode* temp = l->head;
 		l->head = l->head->next;
-		kfree(l->temp);
+		kfree(temp);
 		l->num--;
 		}
 		return 1;
@@ -173,13 +173,7 @@ static osprd_info_t osprds[NOSPRD];
 
 // Declare useful helper functions
 
-unsigned int get_ticket()
-{
-	osp_spin_lock(&d->mutex);
-	my_ticket = d->ticket_head;
-	d->ticket_head++;
-	osp_spin_unlock(&d->mutex);
-}
+
 /*
  * file2osprd(filp)
  *   Given an open file, check whether that file corresponds to an OSP ramdisk.
@@ -283,7 +277,7 @@ static int osprd_close_last(struct inode *inode, struct file *filp)
 		}
 		osp_spin_unlock(&d->mutex);
 		if(wake == 't')
-			wake_up_all(d->blockq);
+			wake_up_all(&d->blockq);
 		(void) filp_writable, (void) d;
 	return 0;
 	}
@@ -375,7 +369,10 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		{
 			if((d->nwriters == 1 && d->writelockPid == current->pid) || findpid(d->readlockPids,current->pid,'f'))
 				return -EDEADLK;
-			my_ticket = get_ticket();
+			osp_spin_lock(&d->mutex);
+			my_ticket = d->ticket_head;
+			d->ticket_head++;
+			osp_spin_unlock(&d->mutex);
 			int stat = wait_event_interruptible(d->blockq, d->ticket_tail == my_ticket && d->nwriters == 0 && d->readlockPids->num == 0);//or filp->f_flags & F_OSPRD_LOCKED == 0
 			if(stat == -ERESTARTSYS)
 			{
@@ -385,7 +382,7 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 					//increment the ticket tail to the first alive 
 					//unlock mutex
 					osp_spin_lock(&d->mutex);
-					while(findticket(exitlist,d->ticket_tail,'f') && d->ticket_tail<d->ticket_head) // increment to first alive process
+					while(findticket(d->exitlist,d->ticket_tail,'f') && d->ticket_tail<d->ticket_head) // increment to first alive process
 					d->ticket_tail++;
 					osp_spin_unlock(&d->mutex);
 				}
@@ -394,8 +391,8 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 				osp_spin_lock(&d->mutex);
 				pushticket(d->exitlist,my_ticket); //what if multiple processes get killed at the same time
 				osp_spin_unlock(&d->mutex);
-				r = stat;
 				}
+				r = stat;
 			}
 			else
 			{
@@ -404,7 +401,7 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 				d->writelockPid = current->pid; 
 				filp->f_flags |= F_OSPRD_LOCKED; // 
 				d->ticket_tail++;//writer calls wake up all only when it releases...
-				while(findticket(exitlist,d->ticket_tail,'f') && d->ticket_tail<d->ticket_head) // increment to first alive process
+				while(findticket(d->exitlist,d->ticket_tail,'f') && d->ticket_tail<d->ticket_head) // increment to first alive process
 					d->ticket_tail++;
 				osp_spin_unlock(&d->mutex);				
 				r = 0;
@@ -414,13 +411,29 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		{
 			if(d->nwriters == 1 && d->writelockPid == current->pid)
 				return -EDEADLK;
-			my_ticket = get_ticket();
+			osp_spin_lock(&d->mutex);
+			my_ticket = d->ticket_head;
+			d->ticket_head++;
+			osp_spin_unlock(&d->mutex);
 			int stat = wait_event_interruptible(d->blockq, d->ticket_tail == my_ticket && d->nwriters == 0);
 			if(stat == -ERESTARTSYS)
 			{
+				if(my_ticket == d->ticket_tail)
+				{
+					//lock mutex
+					//increment the ticket tail to the first alive 
+					//unlock mutex
+					osp_spin_lock(&d->mutex);
+					while(findticket(d->exitlist,d->ticket_tail,'f') && d->ticket_tail<d->ticket_head) // increment to first alive process
+					d->ticket_tail++;
+					osp_spin_unlock(&d->mutex);
+				}
+				else
+				{
 				osp_spin_lock(&d->mutex);
 				pushticket(d->exitlist,my_ticket); //what if multiple processes get killed at the same time
 				osp_spin_unlock(&d->mutex);
+				}
 				r = stat;
 			}
 			else // got the lock
@@ -428,9 +441,11 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 				osp_spin_lock(&d->mutex); //multiple readers try to push into readlist
 				pushpid(d->readlockPids, current->pid);
 				d->ticket_tail++;
+				while(findticket(d->exitlist,d->ticket_tail,'f') && d->ticket_tail<d->ticket_head) // increment to first alive process
+					d->ticket_tail++;
 				filp->f_flags |= F_OSPRD_LOCKED;
 				osp_spin_unlock(&d->mutex);
-				wake_up_all(d->blockq);// just incrementing ticket_tail doesnt work, must also wake up all to make them reevaluate condition.
+				wake_up_all(&d->blockq);// just incrementing ticket_tail doesnt work, must also wake up all to make them reevaluate condition.
 				r = 0;
 			}
 		}
@@ -489,7 +504,7 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// Your code here (instead of the next line).
 		//r = -ENOTTY;
 		
-		if(!(file->f_flags & F_OSPRD_LOCKED))
+		if(!(filp->f_flags & F_OSPRD_LOCKED))
 			return -EINVAL;
 		osp_spin_lock(&d->mutex);
 		char wake = 't';
@@ -510,7 +525,7 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		}
 		osp_spin_unlock(&d->mutex);
 		if(wake == 't')
-			wake_up_all(d->blockq);
+			wake_up_all(&d->blockq);
 		r = 0;
 		
 	} else

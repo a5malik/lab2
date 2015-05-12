@@ -297,7 +297,26 @@ static int osprd_close_last(struct inode *inode, struct file *filp)
  */
 
 /*
- * osprd_ioctl(inode, filp, cmd, arg)
+ * osprd_ioctl(inode, filp, cmd, arg)osp_spin_lock(&d->mutex);
+		char wake = 't';
+		if(d->readlockPids->num > 1)
+		{
+			findpid(d->readlockPids,current->pid,'r');
+			wake = 'f';
+		}
+		else if(d->readlockPids->num == 1)
+		{
+			findpid(d->readlockPids,current->pid,'r');
+			filp->f_flags &= ~F_OSPRD_LOCKED;
+		}
+		else //must be a writer.....
+		{
+			d->nwriters = 0;
+			filp->f_flags &= ~F_OSPRD_LOCKED;
+		}
+		osp_spin_unlock(&d->mutex);
+		if(wake == 't')
+			wake_up_all(d->blockq);
  *   Called to perform an ioctl on the named file.
  */
 int osprd_ioctl(struct inode *inode, struct file *filp,
@@ -354,14 +373,29 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// Your code here (instead of the next two lines).
 		if(filp_writable)
 		{
+			if((d->nwriters == 1 && d->writelockPid == current->pid) || findpid(d->readlockPids,current->pid,'f'))
+				return -EDEADLK;
 			my_ticket = get_ticket();
-			int stat = wait_event_interruptible(d->blockq, d->ticket_tail == my_ticket && d->nwriters == 0 && d->readlockPids->num == 0);
+			int stat = wait_event_interruptible(d->blockq, d->ticket_tail == my_ticket && d->nwriters == 0 && d->readlockPids->num == 0);//or filp->f_flags & F_OSPRD_LOCKED == 0
 			if(stat == -ERESTARTSYS)
 			{
+				if(my_ticket == d->ticket_tail)
+				{
+					//lock mutex
+					//increment the ticket tail to the first alive 
+					//unlock mutex
+					osp_spin_lock(&d->mutex);
+					while(findticket(exitlist,d->ticket_tail,'f') && d->ticket_tail<d->ticket_head) // increment to first alive process
+					d->ticket_tail++;
+					osp_spin_unlock(&d->mutex);
+				}
+				else
+				{
 				osp_spin_lock(&d->mutex);
 				pushticket(d->exitlist,my_ticket); //what if multiple processes get killed at the same time
 				osp_spin_unlock(&d->mutex);
 				r = stat;
+				}
 			}
 			else
 			{
@@ -370,15 +404,16 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 				d->writelockPid = current->pid; 
 				filp->f_flags |= F_OSPRD_LOCKED; // 
 				d->ticket_tail++;//writer calls wake up all only when it releases...
-				while(findticket(exitlist,d->ticket_tail,'f') && d->ticket_tail<d->ticket_head)
+				while(findticket(exitlist,d->ticket_tail,'f') && d->ticket_tail<d->ticket_head) // increment to first alive process
 					d->ticket_tail++;
-				osp_spin_unlock(&d->mutex);
-				
+				osp_spin_unlock(&d->mutex);				
 				r = 0;
 			}
 		}
 		else
 		{
+			if(d->nwriters == 1 && d->writelockPid == current->pid)
+				return -EDEADLK;
 			my_ticket = get_ticket();
 			int stat = wait_event_interruptible(d->blockq, d->ticket_tail == my_ticket && d->nwriters == 0);
 			if(stat == -ERESTARTSYS)

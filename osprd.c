@@ -43,6 +43,16 @@ MODULE_AUTHOR("Skeletor");
  * as an argument to insmod: "insmod osprd.ko nsectors=4096" */
 static int nsectors = 32;
 module_param(nsectors, int, 0);
+struct listnode{
+	pid_t pid;
+	unsigned int ticket;
+	struct listnode* next;
+};
+struct list{
+	struct listnode* head;
+	struct listnode* tail;
+	int num;
+};
 void pushpid(struct list* l, pid_t pid)
 {
 	struct listnode* node = (struct listnode*)kmalloc(sizeof(struct listnode),GFP_ATOMIC);
@@ -87,6 +97,7 @@ int findpid(struct list* l, pid_t pid, char remove)
 			}
 			return 1;
 		}
+		curnode = curnode->next;
 	}
 	return 0;
 }
@@ -134,6 +145,7 @@ int findticket(struct list* l, unsigned int ticket, char remove)
 			}
 			return 1;
 		}
+		curnode = curnode->next;
 	}
 	return 0;
 }
@@ -226,7 +238,7 @@ static void osprd_process_request(osprd_info_t *d, struct request *req)
 	{
 		memcpy(ptr,req->buffer,req->current_nr_sectors*SECTOR_SIZE);
 	}
-	//end_request(req, 1);
+	end_request(req, 1);
 }
 
 
